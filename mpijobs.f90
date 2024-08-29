@@ -1,22 +1,24 @@
+!
+! This is a simple scheduler of jobs among processes
+!
+! See "example" code in main.f90 how to use this module
+!
+
 module mpijobs_mod
   use mpi_f08
   implicit none
   private
-  public :: UNASSIGNED, ROOT
-
-  integer, parameter :: ROOT = 0
-  integer, parameter :: TAG_COMPLETED = 11, TAG_ASSIGNED = 12
-  integer, parameter :: UNASSIGNED = -1
 
   ! Set this to switch on/off printing send/received messages
-  integer, parameter :: DEBUG = 0
-    !! DEBUG = 0, 1
+  integer, parameter :: DEBUG = 1
+    !! DEBUG = 0, 1-warn, 2-info
 
   integer, parameter, public :: &
     S_WAITING   = 0, & ! waiting for a new job
-    S_NEWJOB    = 1, & ! received a new job (or signal no more jobs)
+    S_NEWJOB    = 1, & ! received a new job
     S_WORKING   = 2, & ! is working on the job
-    S_COMPLETED = 3    ! job completed, has to send completed message
+    S_COMPLETED = 3, & ! job completed, has to send a "completed" message
+    S_FINISHED  = 4    ! received signal that there will be no more jobs
 
   type, public :: mpijobs_t
     private
@@ -28,7 +30,7 @@ module mpijobs_mod
     logical, allocatable :: is_working(:), is_finished(:)
     integer :: state = S_WAITING
   contains
-    procedure :: myrank, getstate, set_working, set_completed
+    procedure :: myrank, getstate, set_working, set_completed, amiroot
     procedure :: init => mpijobs_init
     procedure :: finalize => mpijobs_finalize
     procedure :: receive_job
@@ -36,7 +38,19 @@ module mpijobs_mod
     procedure :: dispatcher
   end type
 
+  integer, parameter :: ROOT = 0
+  integer, parameter :: TAG_COMPLETED = 11, TAG_ASSIGNED = 12
+  integer, parameter :: UNASSIGNED = -1     ! taken values are 0..np-1
+  integer, parameter :: NULL_JOBINDEX = 0   ! taken values are 1..size(jobs)
+
 contains
+
+  pure function amiroot(this)
+    class(mpijobs_t), intent(in) :: this
+    logical amiroot
+    amiroot = this%rank == ROOT
+  end function
+
 
   pure function myrank(this)
     class(mpijobs_t), intent(in) :: this
@@ -66,8 +80,9 @@ contains
   end subroutine
 
 
-  subroutine mpijobs_init(this)
+  subroutine mpijobs_init(this, jobs)
     class(mpijobs_t), intent(inout) :: this
+    integer, intent(inout) :: jobs(:)
     integer :: ierr
 
     this%comm = MPI_COMM_WORLD
@@ -80,15 +95,19 @@ contains
     call mpi_comm_size(this%comm, this%np, ierr)
     if (ierr /= 0) error stop 'mpi_comm_size error'
 
-    this%jobindex = 1 ! first unassigned job in the index
     this%completed_send_req = MPI_REQUEST_NULL
-    if (allocated(this%assigned_send_reqs)) deallocate(this%assigned_send_reqs)
-    allocate(this%assigned_send_reqs(0:this%np-1), source=MPI_REQUEST_NULL)
-    if (allocated(this%is_working)) deallocate(this%is_working)
-    allocate(this%is_working(0:this%np-1), source=.false.)
-    if (allocated(this%is_finished)) deallocate(this%is_finished)
-    allocate(this%is_finished(0:this%np-1), source=.false.)
-  end subroutine
+
+    if (this%rank==ROOT) then
+      jobs = UNASSIGNED
+      this%jobindex = 1 ! first unassigned job in the index
+      if (allocated(this%assigned_send_reqs)) deallocate(this%assigned_send_reqs)
+      allocate(this%assigned_send_reqs(0:this%np-1), source=MPI_REQUEST_NULL)
+      if (allocated(this%is_working)) deallocate(this%is_working)
+      allocate(this%is_working(0:this%np-1), source=.false.)
+      if (allocated(this%is_finished)) deallocate(this%is_finished)
+      allocate(this%is_finished(0:this%np-1), source=.false.)
+    end if
+  end subroutine mpijobs_init
 
 
   subroutine mpijobs_finalize(this)
@@ -96,34 +115,35 @@ contains
     integer :: ierr, i
     type(MPI_STATUS) :: status
 
-    do i=lbound(this%assigned_send_reqs,1),ubound(this%assigned_send_reqs,1)
-      if (this%assigned_send_reqs(i) == MPI_REQUEST_NULL) cycle
- print *, 'finalize - waiting to clear send request', i
-      call mpi_wait(this%assigned_send_reqs(i), status, ierr)
-      if (ierr /= 0) error stop 'mpi_wait error'
-    end do
     if (this%completed_send_req /= MPI_REQUEST_NULL) then
- print *, 'finalize - waiting to clear send request'
+      if (DEBUG > 0) print &
+        '("finalized rank ",i0," waiting to clear request")',this%rank
       call mpi_wait(this%completed_send_req, status, ierr)
       if (ierr /= 0) error stop 'mpi_wait error'
     end if
 
-    deallocate(this%assigned_send_reqs, this%is_working, this%is_finished)
+    if (this%rank==ROOT) then
+      do i=lbound(this%assigned_send_reqs,1),ubound(this%assigned_send_reqs,1)
+        if (this%assigned_send_reqs(i) == MPI_REQUEST_NULL) cycle
+        if (DEBUG > 0) print &
+          '("finalized root waiting to clear request to rank ",i0,".")', i
+        call mpi_wait(this%assigned_send_reqs(i), status, ierr)
+        if (ierr /= 0) error stop 'mpi_wait error'
+      end do
+
+      deallocate(this%assigned_send_reqs, this%is_working, this%is_finished)
+    end if
 
     call mpi_finalize(ierr)
     if (ierr /= 0) error stop 'mpi_finalize error'
-  end subroutine
+  end subroutine mpijobs_finalize
 
 
   subroutine receive_job(this, jobindex)
 !
 ! Receive TAG_ASSIGNED messages from root.
-! "jobindex==0" on output signalizes no more jobs can be assigned.
-!
-! For root process: "got_job==.false." on output means that no message
-! was received.
-! Other processes: This is a blocking subroutine and "got_job" is always
-! true on return.
+! State is changed from S_WAITING to S_NEWJOB or S_FINISHED
+! if a message is waiting and was received.
 !
     class(mpijobs_t), intent(inout) :: this
     integer, intent(out) :: jobindex
@@ -147,21 +167,21 @@ contains
     call mpi_recv(jobindex, 1, MPI_INTEGER, &
       ROOT, TAG_ASSIGNED, this%comm, status, ierr)
     if (ierr /= 0) error stop 'mpi_recv error'
-    if (DEBUG > 0) print &
+    if (DEBUG > 1) print &
       '("Process ",i0," received job index ",i0,".")', this%rank, jobindex
-    this%state = S_NEWJOB
+    if (jobindex==NULL_JOBINDEX) then
+      this%state = S_FINISHED
+    else
+      this%state = S_NEWJOB
+    end if
   end subroutine receive_job
 
 
   subroutine send_completed(this, jobindex)
 !
 ! Send "completed" message to root.
-!
-! For root process: "able_to_send=.false." signalizes that the send from the
-! previous call has not yet been received, and nothing has been sent during
-! this call.
-! Other processes: This is a blocking subroutine and "able_to_send" is
-! always true on return.
+! State is changed from S_COMPLETED to S_WAITING if "completed" message
+! has been send. If last message was not yet received, nothing is done
 !
     class(mpijobs_t), intent(inout) :: this
     integer, intent(in) :: jobindex
@@ -170,6 +190,7 @@ contains
     integer :: ierr
     logical :: flag
 
+    ! Is in the correct state?
     if (this%state /= S_COMPLETED) return
 
     if (this%rank==ROOT) then
@@ -183,20 +204,18 @@ contains
         end if
       end if
 
-      if (jobindex /= 0) then
-        call mpi_issend(jobindex, 1, MPI_INTEGER, ROOT, TAG_COMPLETED, &
-          this%comm, this%completed_send_req, ierr)
-        if (ierr /= 0) error stop 'mpi_issend error'
-        if (DEBUG > 0) print &
-          '("Process ",i0," sended message complete ",i0," to root")', this%rank, jobindex
-      end if
+      call mpi_issend(jobindex, 1, MPI_INTEGER, ROOT, TAG_COMPLETED, &
+        this%comm, this%completed_send_req, ierr)
+      if (ierr /= 0) error stop 'mpi_issend error'
+      if (DEBUG > 1) print &
+        '("Process ",i0," sended message complete ",i0," to root")', this%rank, jobindex
 
     else
       ! blocking send for workers
       call mpi_ssend(jobindex, 1, MPI_INTEGER, ROOT, TAG_COMPLETED, &
         this%comm, ierr)
       if (ierr /= 0) error stop 'mpi_ssend error'
-      if (DEBUG > 0) print &
+      if (DEBUG > 1) print &
         '("Process ",i0," sended message complete ",i0," to root")', this%rank, jobindex
     end if
     this%state = S_WAITING
@@ -208,11 +227,11 @@ contains
     integer, intent(inout) :: jobs(:)
     logical, intent(out) :: is_end
 !
-! Receive "job_complete" messages and send "assign_job" messages
+! Receive "completed" messages and send "assigned" messages.
 ! Array "jobs" keeps track to which processes have been jobs assigned,
-! Set it to "UNASSIGNED" initially.
-! Root will send an index of jobs array or "0" if no more jobs
-! are left
+! Must be set to "UNASSIGNED" in "init" procedure.
+! Root will send an index of jobs array or NULL_JOBINDEX if no more jobs
+! are left.
 !
     integer :: ierr
     logical :: flag
@@ -223,7 +242,7 @@ contains
     is_end = .false.
     if (this%rank /= ROOT) return
 
-    ! process all pending "completed" messages
+    ! receive all pending "completed" messages
     RECEIVE_LOOP: do
       call mpi_iprobe(MPI_ANY_SOURCE, TAG_COMPLETED, this%comm, flag, &
         status, ierr)
@@ -236,16 +255,20 @@ contains
         MPI_ANY_SOURCE, TAG_COMPLETED, this%comm, status, ierr)
       if (ierr /=0) error stop 'mpi_recv error'
 
-      if (DEBUG > 0) print &
+      if (DEBUG > 1) print &
         '("Root received completed ",i0," from ",i0)', message, status%MPI_SOURCE
+
       ! verify message is correct
       if (.not. this%is_working(status%MPI_SOURCE)) &
         error stop 'bogus complete message, process is not working'
+      if (message == NULL_JOBINDEX) &
+        error stop 'bogus complete message, NULL_JOBINDEX received'
       if (findloc(jobs, status%MPI_SOURCE, back=.true., dim=1) /= message) then
-        print *, 'message / source ', message, status%MPI_SOURCE
-        print *, 'jobs ', jobs
-        error stop 'bogus complete message, wrong jobindex'
+        print '("message ",i0,"  source ",i0)', message, status%MPI_SOURCE
+        print '("jobs array: ",/,10(i0,1x))', jobs
+        error stop 'bogus message, received an unexpected value of jobindex'
       end if
+
       this%is_working(status%MPI_SOURCE) = .false.
     end do RECEIVE_LOOP
 
@@ -255,20 +278,20 @@ contains
       if (i==ROOT) then
         call mpi_test(this%assigned_send_reqs(i), flag, status, ierr)
         if (.not. flag .and. DEBUG>0) &
-          print *, 'send to root hanging during this call'
+          print '("Send assigned to rank ",i0," is still hanging")',i
       else
         call mpi_wait(this%assigned_send_reqs(i), status, ierr)
       end if
       if (ierr /= 0) error stop 'mpi_wait/test error'
     end do
 
-    ! send to free processes jobs
-    JOB_LOOP: do
-      if (this%jobindex > size(jobs)) this%jobindex = 0
-      do i=0, this%np-1
+    ! send unassigned jobs to free processes
+    JOBS_LOOP: do
+      if (this%jobindex > size(jobs)) this%jobindex = NULL_JOBINDEX
+      PROCS: do i=0, this%np-1
         ! skip busy or finished processes, or processes with incomplete sends
         if (this%is_working(i) .or. this%is_finished(i) .or. &
-            this%assigned_send_reqs(i) /= MPI_REQUEST_NULL) cycle
+            this%assigned_send_reqs(i) /= MPI_REQUEST_NULL) cycle PROCS
 
         ! send assigning message and exit
         call mpi_issend(this%jobindex, 1, MPI_INTEGER, i, TAG_ASSIGNED, &
@@ -277,30 +300,31 @@ contains
 
         this%is_working(i) = .true.
 
-        if (this%jobindex /= 0) then
+        if (this%jobindex /= NULL_JOBINDEX) then
           jobs(this%jobindex) = i
-          if (DEBUG > 0) print &
+          if (DEBUG > 1) print &
             '("Task no ",i0," assigned to process ",i0,".")', this%jobindex, i
           this%jobindex = this%jobindex+1
         else
           this%is_finished(i) = .true.
         end if
-        exit
-      end do
-      ! all processes are now busy, exit
-      if (i == this%np) exit JOB_LOOP
-    end do JOB_LOOP
+        exit PROCS
+      end do PROCS
+      ! we looped over all processes, exit
+      if (i == this%np) exit JOBS_LOOP
+    end do JOBS_LOOP
 
     is_end = all(this%is_finished) .and. &
              all(request_null(this%assigned_send_reqs))
 
   end subroutine dispatcher
 
-
+  ! because == operator is not elemental for MPI_REQUEST objects,
+  ! this is an in-house fix...
   impure elemental function request_null(a)
     type(MPI_REQUEST), intent(in) :: a
     logical request_null
     request_null = a==MPI_REQUEST_NULL
   end function request_null
 
-end module
+end module mpijobs_mod

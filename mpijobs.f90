@@ -193,7 +193,7 @@ contains
     ! Is in the correct state?
     if (this%state /= S_COMPLETED) return
 
-    if (this%rank==ROOT) then
+ !! if (this%rank==ROOT) then
       ! non-blocking send for ROOT, send is not made if the send from
       ! the last call has not been yet received
       if (this%completed_send_req /= MPI_REQUEST_NULL) then
@@ -210,14 +210,14 @@ contains
       if (DEBUG > 1) print &
         '("Process ",i0," sended message complete ",i0," to root")', this%rank, jobindex
 
-    else
+!!  else
       ! blocking send for workers
-      call mpi_ssend(jobindex, 1, MPI_INTEGER, ROOT, TAG_COMPLETED, &
-        this%comm, ierr)
-      if (ierr /= 0) error stop 'mpi_ssend error'
-      if (DEBUG > 1) print &
-        '("Process ",i0," sended message complete ",i0," to root")', this%rank, jobindex
-    end if
+!!    call mpi_ssend(jobindex, 1, MPI_INTEGER, ROOT, TAG_COMPLETED, &
+!!      this%comm, ierr)
+!!    if (ierr /= 0) error stop 'mpi_ssend error'
+!!    if (DEBUG > 1) print &
+!!      '("Process ",i0," sended message complete ",i0," to root")', this%rank, jobindex
+!!  end if
     this%state = S_WAITING
   end subroutine send_completed
 
@@ -275,13 +275,13 @@ contains
     ! clear requests from a previous run
     do i=0, this%np-1
       if (this%assigned_send_reqs(i)==MPI_REQUEST_NULL) cycle
-      if (i==ROOT) then
+!!    if (i==ROOT) then
         call mpi_test(this%assigned_send_reqs(i), flag, status, ierr)
         if (.not. flag .and. DEBUG>0) &
           print '("Send assigned to rank ",i0," is still hanging")',i
-      else
-        call mpi_wait(this%assigned_send_reqs(i), status, ierr)
-      end if
+!!    else
+!!      call mpi_wait(this%assigned_send_reqs(i), status, ierr)
+!!    end if
       if (ierr /= 0) error stop 'mpi_wait/test error'
     end do
 

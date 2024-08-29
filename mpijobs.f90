@@ -3,6 +3,8 @@
 !
 ! See "example" code in main.f90 how to use this module
 !
+! (c)2024 Z. Grof (grofz@vscht.cz)
+!
 
 module mpijobs_mod
   use mpi_f08
@@ -13,8 +15,17 @@ module mpijobs_mod
   integer, parameter :: DEBUG = 1
     !! DEBUG = 0, 1-warn, 2-info
 
+  ! process states used to control flow in the event loop "state"
+  !
+  !    ------------------------------------
+  !    |                                  |
+  !    v                                  |
+  ! WAITING --> NEWJOB --> WORKING --> COMPLETED
+  !    |
+  !    -------> FINISHED
+  !
   integer, parameter, public :: &
-    S_WAITING   = 0, & ! waiting for a new job
+    S_WAITING   = 0, & ! waiting for a new job (initial state)
     S_NEWJOB    = 1, & ! received a new job
     S_WORKING   = 2, & ! is working on the job
     S_COMPLETED = 3, & ! job completed, has to send a "completed" message
@@ -27,7 +38,7 @@ module mpijobs_mod
     integer :: jobindex=1 ! index to first unassigned job in jobs array
     type(MPI_Request) :: completed_send_req
     type(MPI_Request), allocatable :: assigned_send_reqs(:)
-    logical, allocatable :: is_working(:), is_finished(:)
+    integer, allocatable :: pstates(:)
     integer :: state = S_WAITING
   contains
     procedure :: myrank, getstate, set_working, set_completed, amiroot
@@ -42,6 +53,23 @@ module mpijobs_mod
   integer, parameter :: TAG_COMPLETED = 11, TAG_ASSIGNED = 12
   integer, parameter :: UNASSIGNED = -1     ! taken values are 0..np-1
   integer, parameter :: NULL_JOBINDEX = 0   ! taken values are 1..size(jobs)
+
+  ! process states used in dispatcher's "pstates" array
+  !
+  !  ------------------a--------------
+  !  | ----b-----                    |
+  !  | |        |                    |
+  !  v v        |                    |
+  ! FREE --> ASSI_SENT --> WORKING --|
+  !    |
+  !    |---> FINI_SENT --> FINISHED
+  !
+  integer, parameter :: &
+    P_FREE          = 0, & ! available processes (initial state)
+    P_ASSIGNED_SENT = 1, & ! "assign job" message not yet completed
+    P_WORKING       = 2, & ! "assign job" message completed
+    P_FINISHED_SENT = 3, & ! "finished" message not yet completed
+    P_FINISHED      = 4    ! "finished" message completed (final state)
 
 contains
 
@@ -102,10 +130,8 @@ contains
       this%jobindex = 1 ! first unassigned job in the index
       if (allocated(this%assigned_send_reqs)) deallocate(this%assigned_send_reqs)
       allocate(this%assigned_send_reqs(0:this%np-1), source=MPI_REQUEST_NULL)
-      if (allocated(this%is_working)) deallocate(this%is_working)
-      allocate(this%is_working(0:this%np-1), source=.false.)
-      if (allocated(this%is_finished)) deallocate(this%is_finished)
-      allocate(this%is_finished(0:this%np-1), source=.false.)
+      if (allocated(this%pstates)) deallocate(this%pstates)
+      allocate(this%pstates(0:this%np-1), source=P_FREE)
     end if
   end subroutine mpijobs_init
 
@@ -131,7 +157,7 @@ contains
         if (ierr /= 0) error stop 'mpi_wait error'
       end do
 
-      deallocate(this%assigned_send_reqs, this%is_working, this%is_finished)
+      deallocate(this%assigned_send_reqs, this%pstates)
     end if
 
     call mpi_finalize(ierr)
@@ -259,8 +285,6 @@ contains
         '("Root received completed ",i0," from ",i0)', message, status%MPI_SOURCE
 
       ! verify message is correct
-      if (.not. this%is_working(status%MPI_SOURCE)) &
-        error stop 'bogus complete message, process is not working'
       if (message == NULL_JOBINDEX) &
         error stop 'bogus complete message, NULL_JOBINDEX received'
       if (findloc(jobs, status%MPI_SOURCE, back=.true., dim=1) /= message) then
@@ -268,19 +292,53 @@ contains
         print '("jobs array: ",/,10(i0,1x))', jobs
         error stop 'bogus message, received an unexpected value of jobindex'
       end if
+      if (this%pstates(status%MPI_SOURCE) == P_WORKING) then
+        ! this is expected (branch a)
+        continue
+      else if (this%pstates(status%MPI_SOURCE) == P_ASSIGNED_SENT) then
+        ! this is rare, but possible (branch b)
+        ! job was completed before root cleared send request
+        ! must clear it now
+        call mpi_test(this%assigned_send_reqs(status%MPI_SOURCE), &
+          flag, status, ierr)
+        if (ierr /= 0) error stop 'mpi_test error'
+        if (.not. flag) &
+          error stop 'bogus complete message, process did not receive assign'
+      else
+        error stop 'bogus complete message, process is not working'
+      end if
 
-      this%is_working(status%MPI_SOURCE) = .false.
+      this%pstates(status%MPI_SOURCE) = P_FREE
     end do RECEIVE_LOOP
 
     ! clear requests from a previous run
     do i=0, this%np-1
       if (this%assigned_send_reqs(i)==MPI_REQUEST_NULL) cycle
+
+      ! assert we are in "P_ASSIGNED/FINISHED_SEND" state
+      if (this%pstates(i)/=P_ASSIGNED_SENT .and. &
+          this%pstates(i)/=P_FINISHED_SENT) &
+          error stop 'unexpect state in this context'
+
       if (i==ROOT) then
         call mpi_test(this%assigned_send_reqs(i), flag, status, ierr)
-        if (.not. flag .and. DEBUG>0) &
-          print '("Send assigned to rank ",i0," is still hanging")',i
       else
         call mpi_wait(this%assigned_send_reqs(i), status, ierr)
+        flag = .true.
+      end if
+      if (.not. flag) then
+        if (DEBUG>0) print &
+          '("Send assigned to rank ",i0," is still hanging")',i
+      else
+        ! send completed, update state
+        select case(this%pstates(i))
+        case(P_ASSIGNED_SENT)
+          this%pstates(i) = P_WORKING
+        case(P_FINISHED_SENT)
+          this%pstates(i) = P_FINISHED
+        case default
+          error stop 'unexpect state in this context'
+        end select
       end if
       if (ierr /= 0) error stop 'mpi_wait/test error'
     end do
@@ -290,23 +348,25 @@ contains
       if (this%jobindex > size(jobs)) this%jobindex = NULL_JOBINDEX
       PROCS: do i=0, this%np-1
         ! skip busy or finished processes, or processes with incomplete sends
-        if (this%is_working(i) .or. this%is_finished(i) .or. &
-            this%assigned_send_reqs(i) /= MPI_REQUEST_NULL) cycle PROCS
+        if (this%pstates(i) /= P_FREE) cycle PROCS
+
+        ! defeensive check
+        if (this%assigned_send_reqs(i) /= MPI_REQUEST_NULL) &
+          error stop 'assigned_send_reqs not null where ecpected to be null'
 
         ! send assigning message and exit
         call mpi_issend(this%jobindex, 1, MPI_INTEGER, i, TAG_ASSIGNED, &
             this%comm, this%assigned_send_reqs(i), ierr)
         if (ierr /= 0) error stop 'mpi_issend error'
 
-        this%is_working(i) = .true.
-
         if (this%jobindex /= NULL_JOBINDEX) then
           jobs(this%jobindex) = i
           if (DEBUG > 1) print &
             '("Task no ",i0," assigned to process ",i0,".")', this%jobindex, i
           this%jobindex = this%jobindex+1
+          this%pstates(i) = P_ASSIGNED_SENT
         else
-          this%is_finished(i) = .true.
+          this%pstates(i) = P_FINISHED_SENT
         end if
         exit PROCS
       end do PROCS
@@ -314,11 +374,11 @@ contains
       if (i == this%np) exit JOBS_LOOP
     end do JOBS_LOOP
 
-    is_end = all(this%is_finished) .and. &
-             all(request_null(this%assigned_send_reqs))
+    is_end = all(this%pstates==P_FINISHED)
 
   end subroutine dispatcher
 
+  ! WE ARE NOT USING THIS AT THE MOMENT
   ! because == operator is not elemental for MPI_REQUEST objects,
   ! this is an in-house fix...
   impure elemental function request_null(a)
